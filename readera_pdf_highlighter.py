@@ -234,6 +234,8 @@ def help():
     print("  make-highlighted-pdf <book_filename>")
     print("    Convert book to PDF and add highlights from ReadEra backup")
 
+
+sys.stdout.reconfigure(encoding='utf-8')
 try:
     cmd = sys.argv[1]
 except IndexError:
