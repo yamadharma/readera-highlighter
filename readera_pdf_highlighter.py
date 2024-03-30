@@ -188,8 +188,7 @@ def add_citations_to_pdf(pdf_filename, citations):
                 num_not_found += 1
                 page_index = page_index_last_found
 
-    #doc.saveIncr()
-    doc.save(str(pdf_filename).replace('.pdf', '_new.pdf'))
+    doc.saveIncr()
 
     print(f"Citations found: {num_found}")
     if num_not_found > 0:
