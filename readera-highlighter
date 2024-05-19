@@ -89,7 +89,9 @@ def show_titles(readera_backup_filename):
             print(f"{book_info.title}, Citations: {len(book_info.citations)}")
 
 def get_citations_by_file(readera_backup_filename, book_filename):
+    print(book_filename) # DEBUG
     uris_to_book_infos = get_all_citations(readera_backup_filename)
+    # print(uris_to_book_infos)
     for book_info in uris_to_book_infos.values():
         if book_info.filename == book_filename:
             return book_info
@@ -98,6 +100,7 @@ def get_citations_by_file(readera_backup_filename, book_filename):
 def show_citations_for_book(readera_backup_filename, book):
     if Path(book).is_file():
         book_info = get_citations_by_file(readera_backup_filename, book)
+        print(book_info) # DEBUG
     else:
         uris_to_book_infos = get_all_citations(readera_backup_filename)
         for book_info in uris_to_book_infos.values():
@@ -116,7 +119,15 @@ def show_citations_for_book(readera_backup_filename, book):
         print()
 
 def tokenize(text):
-    return re.findall(r'''[A-Za-z0-9!?.,;:'"]''', text)
+    LANGS = [
+        'ÁáČčĎďÉéĚěÍíŇňÓóŘřŠšŤťÚúŮůÝýŽž',   # Czech
+        'ÄäÖöÜüẞß',                         # German
+        'ĄąĆćĘęŁłŃńÓóŚśŹźŻż',               # Polish
+        'À-ú',                              # Portuguese
+    ]
+    pattern = r'''[A-Za-zА-Яа-я0-9!?.,;:'"{langs}]'''.format(langs=''.join(LANGS))
+    return re.findall(pattern, text)
+    # return re.findall(r'''[A-Za-zА-Яа-я0-9!?.,;:'"]''', text)
 
 def find_in(text: str, span: str) -> tuple[int, int, str]:
     # Returns (start_index_of_match, end_index_of_match, remainder of span that was not matched)
@@ -161,6 +172,7 @@ def add_citations_to_pdf(pdf_filename, citations):
                 textpage_string, char_coords = get_textpage_words(page_index)
 
                 match_start, match_end, remainder = find_in(textpage_string, remainder)
+                print(match_start) # DEBUG
                 if match_start is None:
                     remainder = citation_string
                     highlights = []
@@ -181,9 +193,12 @@ def add_citations_to_pdf(pdf_filename, citations):
                     page_index += 1
                 else:
                     for page, start_coords, stop_coords in highlights:
-                        page.add_highlight_annot(start=start_coords, stop=stop_coords)
+                        annot = page.add_highlight_annot(start=start_coords, stop=stop_coords)
                         if note is not None:
-                            page.add_text_annot(start_coords - fitz.Point(8, 16), note)
+                            # page.add_text_annot(start_coords - fitz.Point(8, 16), note)
+                            # annot.parent.insert_text(annot.rect.br, note)
+                            annot.set_info(content=note)
+                            annot.update()
                     page_index_last_found = page_index
                     num_found += 1
                     break
@@ -212,7 +227,7 @@ def book_to_pdf(book_filename, pdf_filename):
 
 def make_highlighted_pdf(readera_backup_filename, book_filename):
     book_info = get_citations_by_file(readera_backup_filename, book_filename)
-    print(book_info)
+    # print(book_info) # DEBUG
 
     if not book_info:
         print(f"Book {book_filename} not found")
@@ -259,8 +274,8 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
-print(args)
-            
+print(args) # DEBUG
+
 if args.verify_citations_complete == 1:
     verify_citations_complete()
 else:
@@ -283,4 +298,3 @@ else:
         make_highlighted_pdf(readera_backup_filename, book_filename)
     else:
         sys.exit(1)
-
