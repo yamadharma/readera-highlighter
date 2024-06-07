@@ -101,6 +101,14 @@ def show_titles(readera_backup_filename):
         if len(book_info.citations) > 0:
             print(f"{book_info.title}, Citations: {len(book_info.citations)}")
 
+
+def make_highlighted_bystate(readera_backup_filename):
+    uris_to_book_infos = get_all_citations(readera_backup_filename)
+    for book_info in sorted(uris_to_book_infos.values(), key=lambda book_info: book_info.title):
+        if len(book_info.citations) > 0:
+            print(book_info.filename)
+            make_highlighted_pdf(readera_backup_filename, book_info.filename)
+
 def get_citations_by_file(readera_backup_filename, book_filename):
     print(book_filename) # DEBUG
     uris_to_book_infos = get_all_citations(readera_backup_filename)
@@ -307,6 +315,12 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    '--add-highlights-bystate',
+    action = 'store_true',
+    help = 'add highlights from ReadEra backup based on state'
+)
+
+parser.add_argument(
     '--show-citations',
     help = 'show citations'
 )
@@ -339,7 +353,7 @@ parser.add_argument(
 parser.add_argument(
     '--state',
     choices = ['all', 'readed'],
-    default = 'all',
+    # default = 'all',
     help = 'state of book'
 )
 
@@ -358,7 +372,7 @@ else:
         else:
             readera_backup_filename = max(readera_backup_filenames, key=lambda f: f.stat().st_mtime)
     print(f"Using {readera_backup_filename}")
-    if args.show_titles == 1:
+    if args.show_titles:
         show_titles(readera_backup_filename)
     elif args.show_citations is not None:
         book_title = args.show_citations
@@ -366,5 +380,7 @@ else:
     elif args.add_highlights is not None:
         book_filename = args.add_highlights
         make_highlighted_pdf(readera_backup_filename, book_filename)
+    elif args.add_highlights_bystate:
+        make_highlighted_bystate(readera_backup_filename)
     else:
         sys.exit(1)
