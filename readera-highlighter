@@ -40,6 +40,9 @@ def get_all_citations(readera_backup_filename):
     for doc in data['docs']:
         uri = doc['uri']
         doc_data = doc['data']
+        if args.state == 'readed':
+            if doc_data['doc_have_read_time'] == 0:
+                continue
         try:
             book_title = doc_data['doc_title']
         except KeyError:
@@ -331,6 +334,13 @@ parser.add_argument(
     action = 'store_true',
     default = 'true',
     help = 'add keyword to filename'
+)
+
+parser.add_argument(
+    '--state',
+    choices = ['all', 'readed'],
+    default = 'all',
+    help = 'state of book'
 )
 
 args = parser.parse_args()
