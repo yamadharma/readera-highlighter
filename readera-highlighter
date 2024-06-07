@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import cache
 import json
 import os
+import shutil
 from pathlib import Path
 import re
 import subprocess
@@ -19,6 +20,15 @@ class BookInfo:
     title: str
     filename: str
     citations: set
+
+def fileinfo(file):
+    filename = os.path.basename(file)
+    rootdir = os.path.dirname(file)
+    # lastmod = time.ctime(os.path.getmtime(file))
+    # creation = time.ctime(os.path.getctime(file))
+    filesize = os.path.getsize(file)
+
+    print("%s**\t%s" % (rootdir, filename))
 
 def get_all_citations(readera_backup_filename):
     uris_to_book_infos = {}
@@ -91,8 +101,9 @@ def show_titles(readera_backup_filename):
 def get_citations_by_file(readera_backup_filename, book_filename):
     print(book_filename) # DEBUG
     uris_to_book_infos = get_all_citations(readera_backup_filename)
-    # print(uris_to_book_infos)
+    # print("!!!!!!!!!",uris_to_book_infos.values()) # DEBUG
     for book_info in uris_to_book_infos.values():
+        # print(book_info.filename) # DEBUG
         if book_info.filename == book_filename:
             return book_info
     return None
@@ -227,22 +238,52 @@ def book_to_pdf(book_filename, pdf_filename):
 
 def make_highlighted_pdf(readera_backup_filename, book_filename):
     book_info = get_citations_by_file(readera_backup_filename, book_filename)
-    # print(book_info) # DEBUG
 
     if not book_info:
-        print(f"Book {book_filename} not found")
+        print(f"Book {book_filename} not found in readera's database")
         sys.exit(1)
 
-    pdf_filename = Path(book_filename).with_suffix('.pdf')
-    # book_to_pdf(book_filename, pdf_filename)
-    success = add_citations_to_pdf(pdf_filename, book_info.citations)
-    print(f"Produced highlighted PDF file: {pdf_filename}")
-    if success:
-        print('OK')
-    else:
-        print('ERROR')
-        sys.exit(1)
+    book_filename_keyword = Path(book_filename).with_stem(Path(book_filename).stem+'__note')
 
+    # Check if file exist
+    # Check in working directory
+    for root, dirnames, filenames in os.walk(os.path.expanduser(args.working_directory)):
+        for f in filenames:
+            if f == str(book_filename):
+                if (args.with_keywords):
+                    shutil.copy(book_filename, book_filename_keyword)
+                    success = add_citations_to_pdf(book_filename_keyword, book_info.citations)
+                else:
+                    success = add_citations_to_pdf(book_filename, book_info.citations)
+                print(f"Produced highlighted file: {book_filename}")
+                if success:
+                    print('OK')
+                    return
+                else:
+                    print('ERROR')
+                    sys.exit(1)
+
+    # Check in readera's data path
+    for root, dirnames, filenames in os.walk(os.path.expanduser(args.readera_data_path)):
+        for f in filenames:
+            if f == str(book_filename):
+                print(os.path.join(root, f))
+                shutil.copy(os.path.join(root, f), os.path.expanduser(args.working_directory))
+
+                if (args.with_keywords):
+                    shutil.copy(book_filename, book_filename_keyword)
+                    success = add_citations_to_pdf(book_filename_keyword, book_info.citations)
+                else:
+                    success = add_citations_to_pdf(book_filename, book_info.citations)
+
+                print(f"Produced highlighted file: {book_filename}")
+                if success:
+                    print('OK')
+                else:
+                    print('ERROR')
+                    sys.exit(1)
+
+# Parsing
 parser = argparse.ArgumentParser(description="Readera Highlighter")
 
 parser.add_argument(
@@ -271,6 +312,25 @@ parser.add_argument(
     '--readera-backup-path',
     default = '.',
     help = 'path for backup files of Readera; the current directory by default'
+)
+
+parser.add_argument(
+    '--readera-data-path',
+    default = '.',
+    help = 'path for data files of Readera; the current directory by default'
+)
+
+parser.add_argument(
+    '--working-directory',
+    default = '.',
+    help = 'path for working book files; the current directory by default'
+)
+
+parser.add_argument(
+    '--with-keywords',
+    action = 'store_true',
+    default = 'true',
+    help = 'add keyword to filename'
 )
 
 args = parser.parse_args()
