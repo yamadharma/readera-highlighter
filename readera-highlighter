@@ -254,7 +254,7 @@ def make_highlighted_pdf(readera_backup_filename, book_filename):
         print(f"Book {book_filename} not found in readera's database")
         sys.exit(1)
 
-    book_filename_keyword = Path(book_filename).with_stem(Path(book_filename).stem+'__note')
+    book_filename_keyword = Path(str(book_filename)).with_stem(Path(str(book_filename)).stem+'__note')
 
     # Check if file exist
     # Check in working directory
