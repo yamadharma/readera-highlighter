@@ -120,6 +120,8 @@
 
 # minted
 *.pyg
+*.minted
+_minted/
 
 # morewrites
 *.mw
@@ -178,3 +180,4 @@ tramp
 # cask packages
 .cask/
 
+.DS_Store
