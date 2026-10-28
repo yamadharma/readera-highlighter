@@ -1,393 +1,571 @@
-#! /usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from dataclasses import dataclass
-from functools import cache
+import argparse
 import json
 import os
-import shutil
-from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, field
+from pathlib import Path
 from zipfile import ZipFile
-import argparse
+import pymupdf as fitz
 
-import fitz
+# ----------------------------------------------------------------- модели ---
+
 
 @dataclass
 class BookInfo:
     title: str
     filename: str
-    citations: set
+    citations: set = field(default_factory=set)
 
-def fileinfo(file):
-    filename = os.path.basename(file)
-    rootdir = os.path.dirname(file)
-    # lastmod = time.ctime(os.path.getmtime(file))
-    # creation = time.ctime(os.path.getctime(file))
-    filesize = os.path.getsize(file)
 
-    print("%s**\t%s" % (rootdir, filename))
+# ------------------------------------------------------------- чтение БД ---
 
-def get_all_citations(readera_backup_filename):
+
+def find_library_data_in_zip(zf):
+    """
+    Ищет данные библиотеки в ZIP-архиве.
+    Поддерживает два формата:
+    1. Старый: один файл library.json
+    2. Новый: несколько файлов docs_N.json (фрагменты)
+
+    Возвращает: (тип, данные)
+    - ('single', 'library.json') для старого формата
+    - ('split', ['docs_1.json', 'docs_2.json', ...]) для нового
+    - None если ничего не найдено
+    """
+    names = zf.namelist()
+
+    # 1. Старый формат: один library.json
+    if "library.json" in names:
+        return ("single", "library.json")
+
+    for name in names:
+        if name.endswith("/library.json") or name.endswith("\\library.json"):
+            return ("single", name)
+
+    # 2. Новый формат: фрагменты docs_N.json
+    docs_files = []
+    for name in names:
+        basename = name.split("/")[-1].split("\\")[-1]
+        if basename.startswith("docs_") and basename.endswith(".json"):
+            docs_files.append(name)
+
+    if docs_files:
+        # Сортируем по номеру: docs_1.json, docs_2.json, ...
+        def extract_number(filename):
+            basename = filename.split("/")[-1].split("\\")[-1]
+            # docs_1.json -> 1
+            num_part = basename[5:-5]  # убираем "docs_" и ".json"
+            try:
+                return int(num_part)
+            except ValueError:
+                return 0
+
+        docs_files.sort(key=extract_number)
+        return ("split", docs_files)
+
+    # 3. Ничего не найдено — показываем содержимое архива
+    print(f"Archive contents ({len(names)} files):")
+    for name in sorted(names)[:30]:
+        print(f"  {name}")
+    if len(names) > 30:
+        print(f"  ... and {len(names) - 30} more")
+    return None
+
+
+def load_library_data(zf, library_info):
+    """
+    Загружает данные библиотеки из ZIP-архива.
+    Новый формат: каждый docs_N.json — самостоятельный JSON-массив объектов.
+    """
+    if library_info is None:
+        return None
+
+    fmt, data = library_info
+
+    if fmt == "single":
+        with zf.open(data) as f:
+            return json.load(f)
+
+    elif fmt == "split":
+        all_docs = []
+
+        for filename in data:
+            with zf.open(filename) as f:
+                content = f.read().decode("utf-8").strip()
+
+            try:
+                # Каждый файл — самостоятельный JSON-массив
+                docs = json.loads(content)
+                if isinstance(docs, list):
+                    all_docs.extend(docs)
+                    print(f"    {filename}: {len(docs)} books")
+                else:
+                    print(f"    {filename}: unexpected type {type(docs)}")
+            except json.JSONDecodeError:
+                # Файл может быть фрагментом-продолжением (начинается с ',')
+                # Убираем ведущую запятую, оборачиваем в массив
+                stripped = content.lstrip(" \t\n\r,")
+                try:
+                    docs = json.loads("[" + stripped + "]")
+                    all_docs.extend(docs)
+                    print(f"    {filename}: {len(docs)} books (continuation)")
+                except json.JSONDecodeError as e:
+                    print(f"    {filename}: FAILED to parse: {e}")
+                    print(f"    First 200 chars: {content[:200]}")
+                    return None
+
+        print(f"    Total: {len(all_docs)} books")
+        return {"docs": all_docs}
+
+    return None
+
+
+def get_all_citations(readera_backup_filename, state="all"):
     uris_to_book_infos = {}
     print(f"Reading {readera_backup_filename}")
-    with ZipFile(readera_backup_filename) as backup_file:
-        with backup_file.open('library.json') as f:
-            data = json.load(f)
 
-    for doc in data['docs']:
-        uri = doc['uri']
-        doc_data = doc['data']
-        if args.state == 'readed':
-            if doc_data['doc_have_read_time'] == 0:
-                continue
-        try:
-            book_title = doc_data['doc_title']
-        except KeyError:
-            book_title = doc_data['doc_file_name_title']
-        doc_links = doc['links']
-        # assert len(doc_links) <= 1, doc_links
-        book_format = doc_data['doc_format'].lower()
-        try:
-            book_filename = doc_links[0]['file_name']
-        except IndexError:
-            # book_filename = None
-            book_filename = book_title + '.' + book_format
+    with ZipFile(readera_backup_filename) as backup_file:
+        library_info = find_library_data_in_zip(backup_file)
+        if library_info is None:
+            raise FileNotFoundError(
+                f"No library data found in {readera_backup_filename}. "
+                "Expected library.json or docs_*.json files."
+            )
+
+        fmt, data = library_info
+        if fmt == "single":
+            print(f"  Found old format: {data}")
+        else:
+            print(f"  Found new format: {len(data)} fragments")
+
+        library_data = load_library_data(backup_file, library_info)
+        if library_data is None:
+            raise ValueError(
+                f"Failed to parse library data from {readera_backup_filename}"
+            )
+
+    for doc in library_data.get("docs", []):
+        doc_data = doc.get("data", {})
+
+        if state == "readed" and not doc_data.get("doc_have_read_time", 0):
+            continue
+
+        book_title = (
+            doc_data.get("doc_title")
+            or doc_data.get("doc_file_name_title")
+            or "Untitled"
+        )
+        book_format = str(doc_data.get("doc_format", "epub")).lower()
+        doc_links = doc.get("links") or []
+
+        if doc_links and doc_links[0].get("file_name"):
+            book_filename = doc_links[0]["file_name"]
+        else:
+            book_filename = f"{book_title}.{book_format}"
+
         book_info = BookInfo(book_title, book_filename, set())
-        uris_to_book_infos[uri] = book_info
-        for citation in doc['citations']:
-            try:
-                note_extra = citation['note_extra']
-            except KeyError:
-                note_extra = None
-            book_info.citations.add((citation['note_body'], citation['note_page']+citation['note_index'], note_extra))
+        uris_to_book_infos[doc["uri"]] = book_info
+
+        for citation in doc.get("citations", []):
+            body = citation.get("note_body")
+            if not body:
+                continue
+            position = (citation.get("note_page") or 0) + (
+                citation.get("note_index") or 0
+            )
+            book_info.citations.add((body, position, citation.get("note_extra")))
 
     return uris_to_book_infos
 
-def verify_citations_complete():
-    """
-    Check all ReadEra backup files in the current dir. Collect all citations.
-    For each backup file, show whether it has all citations or which are missing.
-    """
-    all_uris_to_book_infos = {}
-    readera_backups_to_map = {}
-    for readera_backup_filename in sorted(Path(os.path.expanduser(args.readera_backup_path)).glob('ReadEra*bak'), reverse=True):
-        uris_to_book_infos = get_all_citations(readera_backup_filename)
-        readera_backups_to_map[readera_backup_filename] = uris_to_book_infos
-        for uri, book_info in uris_to_book_infos.items():
-            try:
-                all_uris_to_book_infos[uri].citations.update(book_info.citations)
-            except KeyError:
-                all_uris_to_book_infos[uri] = book_info
 
-    for readera_backup_filename, uris_to_book_infos in readera_backups_to_map.items():
-        print(f"Checking {readera_backup_filename}")
-        if uris_to_book_infos == all_uris_to_book_infos:
-            print(f"  Contains all citations")
-        else:
-            for all_uri, all_book_info in all_uris_to_book_infos.items():
-                try:
-                    book_citations = uris_to_book_infos[all_uri].citations
-                    for citation in all_book_info:
-                        if citation not in book_citations:
-                            print(f"  Missing citation: {all_book_info.title} / {citation}")
-                except KeyError:
-                    print(f"  Missing title {all_book_info.title}")
-                    raise
+def find_backup_path(backup_path):
+    env_path = os.getenv("READERA_BACKUP")
+    if env_path:
+        return Path(env_path)
 
-def show_titles(readera_backup_filename):
-    uris_to_book_infos = get_all_citations(readera_backup_filename)
-    for book_info in sorted(uris_to_book_infos.values(), key=lambda book_info: book_info.title):
-        if len(book_info.citations) > 0:
+    candidates = tuple(Path(os.path.expanduser(backup_path)).glob("ReadEra*.bak"))
+    if not candidates:
+        print(f"Did not find any ReadEra backup in {backup_path}")
+        return None
+    return max(candidates, key=lambda f: f.stat().st_mtime)
+
+
+# ---------------------------------------------------------------- режимы ---
+
+
+def verify_citations_complete(backup_path):
+    """Сравнивает все бэкапы и показывает, каких цитат в них не хватает."""
+    all_infos = {}
+    backups_to_map = {}
+
+    for filename in sorted(
+        Path(os.path.expanduser(backup_path)).glob("ReadEra*bak"),
+        reverse=True,
+    ):
+        infos = get_all_citations(filename)
+        backups_to_map[filename] = infos
+        for uri, book_info in infos.items():
+            if uri not in all_infos:
+                all_infos[uri] = BookInfo(book_info.title, book_info.filename, set())
+            all_infos[uri].citations.update(book_info.citations)
+
+    for filename, infos in backups_to_map.items():
+        print(f"Checking {filename}")
+        complete = True
+        for uri, full_info in all_infos.items():
+            current = infos.get(uri)
+            if current is None:
+                print(f"  Missing title: {full_info.title}")
+                complete = False
+                continue
+            missing = full_info.citations - current.citations
+            for citation in sorted(missing, key=lambda item: item[1]):
+                print(f"  Missing citation: {full_info.title} / {citation}")
+                complete = False
+        if complete:
+            print("  Contains all citations")
+
+
+def show_titles(readera_backup_filename, state="all"):
+    infos = get_all_citations(readera_backup_filename, state)
+    for book_info in sorted(infos.values(), key=lambda b: b.title):
+        if book_info.citations:
             print(f"{book_info.title}, Citations: {len(book_info.citations)}")
 
 
-def make_highlighted_bystate(readera_backup_filename):
-    uris_to_book_infos = get_all_citations(readera_backup_filename)
-    for book_info in sorted(uris_to_book_infos.values(), key=lambda book_info: book_info.title):
-        if len(book_info.citations) > 0:
-            print(book_info.filename)
-            make_highlighted_pdf(readera_backup_filename, book_info.filename)
-
-def get_citations_by_file(readera_backup_filename, book_filename):
-    # print("11111",book_filename) # DEBUG
-    uris_to_book_infos = get_all_citations(readera_backup_filename)
-
-    for book_info in uris_to_book_infos.values():
-        # print(book_info) # DEBUG
-        # doc_file_name_title
-        # if book_info.filename == book_filename:
-        if book_info.filename == book_filename:
+def get_citations_by_file(readera_backup_filename, book_filename, state="all"):
+    wanted = Path(book_filename).name
+    infos = get_all_citations(readera_backup_filename, state)
+    for book_info in infos.values():
+        if Path(book_info.filename).name == wanted:
             return book_info
     return None
 
-def show_citations_for_book(readera_backup_filename, book):
+
+def show_citations_for_book(readera_backup_filename, book, state="all"):
     if Path(book).is_file():
         print(f"Searching for file '{book}'")
-        book_info = get_citations_by_file(readera_backup_filename, book)
-        # print(book_info) # DEBUG
+        book_info = get_citations_by_file(
+            readera_backup_filename, Path(book).name, state
+        )
     else:
         print(f"Searching for title '{book}'")
-        uris_to_book_infos = get_all_citations(readera_backup_filename)
-        for book_info in uris_to_book_infos.values():
-            if book.lower() in book_info.title.lower():
-                break
-        else:
-            book_info = None
+        infos = get_all_citations(readera_backup_filename, state)
+        book_info = next(
+            (b for b in infos.values() if book.lower() in b.title.lower()),
+            None,
+        )
 
     if not book_info:
-        print(f"Book not found")
-        sys.exit(1)
+        print("Book not found")
+        return
 
     print(f"Book: {book_info.title}")
     for citation in sorted(book_info.citations, key=lambda item: item[1]):
-        print(f"- {citation[0]}")
-        print()
+        print(f"- {citation[0]}\n")
+
+
+# ----------------------------------------------------- поиск и подсветка ---
+
+LANGS = [
+    "ÁáČčĎďÉéĚěÍíŇňÓóŘřŠšŤťÚúŮůÝýŽž",  # Czech
+    "ÄäÖöÜüẞß",  # German
+    "ĄąĆćĘęŁłŃńÓóŚśŹźŻż",  # Polish
+    "À-ú",  # Portuguese
+    "Ёё",  # Russian
+]
+TOKEN_RE = re.compile(r"[A-Za-zА-Яа-я0-9!?.,;:'\"" + "".join(LANGS) + "]")
+
 
 def tokenize(text):
-    LANGS = [
-        'ÁáČčĎďÉéĚěÍíŇňÓóŘřŠšŤťÚúŮůÝýŽž',   # Czech
-        'ÄäÖöÜüẞß',                         # German
-        'ĄąĆćĘęŁłŃńÓóŚśŹźŻż',               # Polish
-        'À-ú',                              # Portuguese
-    ]
-    pattern = r'''[A-Za-zА-Яа-я0-9!?.,;:'"{langs}]'''.format(langs=''.join(LANGS))
-    return re.findall(pattern, text)
-    # return re.findall(r'''[A-Za-zА-Яа-я0-9!?.,;:'"]''', text)
+    return TOKEN_RE.findall(text)
 
-def find_in(text: str, span: str) -> tuple[int, int, str]:
-    # Returns (start_index_of_match, end_index_of_match, remainder of span that was not matched)
-    # If a remainder is returned, the match was not complete but ended at the end of the text.
-    # When no prefix of span could be found, start_index_of_match and end_index_of_match are None.
-    try:
-        match_index = text.index(span)
-        return match_index, match_index + len(span) - 1, None
-    except ValueError:
-        for i in range(1, len(span)):
-            subspan = span[:-i]
-            if text.endswith(subspan):
-                return len(text) - len(subspan), len(text) - 1, span[len(subspan):]
-    return None, None, span
 
-def add_citations_to_pdf(pdf_filename, citations):
-    doc = fitz.open(pdf_filename)
-    pages = [(page, page.get_textpage(flags=fitz.TEXT_MEDIABOX_CLIP)) for page in doc.pages()]
+def build_text_index(doc):
+    """
+    Один поток символов для всей книги.
+    Для каждого символа помним: номер страницы, прямоугольник слова,
+    ключ строки (чтобы группировать подсветку по строкам).
+    """
+    chars = []
+    records = []
 
-    page_index = page_index_last_found = 0
-    num_found = num_not_found = 0
-
-    @cache
-    def get_textpage_words(page_index) -> tuple[str, list[tuple[int, int, int, int]]]:
-        words = []
-        coords = []
-        for word_info in pages[page_index][1].extractWORDS():
+    for page_index, page in enumerate(doc):
+        textpage = page.get_textpage(flags=fitz.TEXT_MEDIABOX_CLIP)
+        for word_info in textpage.extractWORDS():
             word = word_info[4]
-            word_tokenized = tokenize(word)
-            words += word_tokenized
-            coords += [word_info[:4]] * len(word_tokenized)
-        return ''.join(words), coords
+            rect = fitz.Rect(word_info[:4])
+            line_key = round(rect.y0, 1)
+            for token in tokenize(word):
+                for char in token:
+                    chars.append(char)
+                    records.append((page_index, rect, line_key))
 
-    for citation, _, note in sorted(citations, key=lambda item: item[1]):
-        citation_parts = citation.split('\n')
-        for citation_part in citation_parts:
-            citation_string = ''.join(tokenize(citation_part))
-            remainder = citation_string
-            highlights = []
-            while page_index < len(pages):
-                page, _ = pages[page_index]
-                textpage_string, char_coords = get_textpage_words(page_index)
+    return "".join(chars), records
 
-                match_start, match_end, remainder = find_in(textpage_string, remainder)
-                print(match_start) # DEBUG
-                if match_start is None:
-                    remainder = citation_string
-                    highlights = []
-                else:
-                    if len(highlights) > 0 and match_start > 0:
-                        # This is a partial match which had a partial match on the previous page. But it
-                        # does not start at the beginning of the page, so it is not a true continuation.
-                        # - Ignore match from previous page
-                        # - Check current page for the full citation
-                        remainder = citation_string
-                        highlights = []
-                        continue
+
+def remove_existing_highlights(doc):
+    """Удаляет все существующие highlight-аннотации из документа."""
+    removed_count = 0
+    for page in doc:
+        annots = list(page.annots() or [])
+        for annot in annots:
+            if annot.type[0] == fitz.PDF_ANNOT_HIGHLIGHT:
+                page.delete_annot(annot)
+                removed_count += 1
+    if removed_count > 0:
+        print(f"Removed {removed_count} existing highlight(s)")
+
+
+def add_citations_to_document(doc_filename, citations):
+    """
+    Добавляет подсветку в PDF или EPUB файл.
+    Автоматически удаляет существующие highlight-аннотации перед добавлением новых.
+    """
+    doc = fitz.open(doc_filename)
+    num_found = num_not_found = 0
+    is_epub = doc_filename.lower().endswith(".epub")
+
+    try:
+        # Защита от повторной подсветки: удаляем существующие аннотации
+        remove_existing_highlights(doc)
+
+        text, records = build_text_index(doc)
+        search_from = 0
+
+        for citation, _, note in sorted(citations, key=lambda item: item[1]):
+            for part in citation.split("\n"):
+                needle = "".join(tokenize(part))
+                if not needle:
+                    continue
+
+                # Ищем по порядку чтения, при неудаче — с начала книги.
+                pos = text.find(needle, search_from)
+                if pos < 0:
+                    pos = text.find(needle)
+
+                if pos < 0:
+                    print(f"Citation not found: {part!r}")
+                    num_not_found += 1
+                    continue
+
+                # Группируем совпавшие символы по (страница, строка).
+                groups = []
+                for page_index, rect, line_key in records[pos : pos + len(needle)]:
+                    key = (page_index, line_key)
+                    if groups and groups[-1][0] == key:
+                        groups[-1][1] |= rect
                     else:
-                        highlights.append((page, fitz.Point(char_coords[match_start][:2]),
-                                           fitz.Point(char_coords[match_end][2:])))
+                        groups.append([key, fitz.Rect(rect)])
 
-                if remainder:
-                    page_index += 1
-                else:
-                    for page, start_coords, stop_coords in highlights:
-                        annot = page.add_highlight_annot(start=start_coords, stop=stop_coords)
-                        if note is not None:
-                            # page.add_text_annot(start_coords - fitz.Point(8, 16), note)
-                            # annot.parent.insert_text(annot.rect.br, note)
-                            annot.set_info(content=note)
-                            annot.update()
-                    page_index_last_found = page_index
-                    num_found += 1
-                    break
+                for (page_index, _), rect in groups:
+                    page = doc[page_index]
+                    annot = page.add_highlight_annot(rect)
+                    if note:
+                        annot.set_info(content=note)
+                    annot.update()
+
+                search_from = pos + len(needle)
+                num_found += 1
+
+        # Сохраняем изменения
+        if num_found:
+            if is_epub:
+                # Для EPUB используем save() вместо saveIncr()
+                doc.save(doc_filename, incremental=False, encryption=0)
             else:
-                print(f"Citation not found: {citation_part=}")
-                num_not_found += 1
-                page_index = page_index_last_found
-
-    doc.saveIncr()
+                # Для PDF используем saveIncr()
+                doc.saveIncr()
+    finally:
+        doc.close()
 
     print(f"Citations found: {num_found}")
-    if num_not_found > 0:
+    if num_not_found:
         print(f"Citations not found: {num_not_found}")
-        if '--debug' in sys.argv:
-            with open('book.txt', 'w') as f:
-                for _, textpage in pages:
-                    print(textpage.extractText().encode(), file=f)
-                    print(file=f)
+        if "--debug" in sys.argv:
+            debug_doc = fitz.open(doc_filename)
+            try:
+                with open("book.txt", "w", encoding="utf-8") as f:
+                    for page in debug_doc:
+                        print(page.get_text(), file=f)
+                        print(file=f)
+            finally:
+                debug_doc.close()
         return False
     return True
 
-def book_to_pdf(book_filename, pdf_filename):
-    # Only really tested with epub
-    # Possibly add --embed-all-fonts --subset-embedded-font
-    subprocess.check_call(['ebook-convert', book_filename, pdf_filename])
 
-def make_highlighted_pdf(readera_backup_filename, book_filename):
-    book_info = get_citations_by_file(readera_backup_filename, book_filename)
-    print("!!!!!",book_filename)
-    print(book_info)
+def book_to_pdf(book_filename, pdf_filename):
+    if shutil.which("ebook-convert") is None:
+        raise RuntimeError(
+            "ebook-convert not found. Install Calibre to convert "
+            f"{book_filename} to PDF."
+        )
+    subprocess.check_call(["ebook-convert", str(book_filename), str(pdf_filename)])
+
+
+# ------------------------------------------------------- сборка подсветки ---
+
+
+def locate_book(book_filename, working_directory, data_path):
+    wanted = Path(book_filename).name
+    for directory in (working_directory, data_path):
+        root = Path(os.path.expanduser(directory))
+        if not root.is_dir():
+            continue
+        for found in root.rglob(wanted):
+            if found.is_file():
+                return found
+    return None
+
+
+def make_highlighted_pdf(
+    readera_backup_filename,
+    book_filename,
+    working_directory=".",
+    data_path=".",
+    with_keywords=False,
+    state="all",
+):
+    book_info = get_citations_by_file(readera_backup_filename, book_filename, state)
     if not book_info:
         print(f"Book {book_filename} not found in readera's database")
+        return False
+
+    found = locate_book(book_filename, working_directory, data_path)
+    if found is None:
+        print(f"Book file not found: {book_filename}")
+        return False
+
+    workdir = Path(os.path.expanduser(working_directory))
+    workdir.mkdir(parents=True, exist_ok=True)
+    target = workdir / found.name
+
+    if found.resolve() != target.resolve():
+        shutil.copy2(found, target)
+
+    if with_keywords:
+        target = target.with_stem(target.stem + "__note")
+        shutil.copy2(found, target)
+
+    # Работаем с PDF и EPUB напрямую, конвертация не нужна
+    success = add_citations_to_document(str(target), book_info.citations)
+    print(f"Produced highlighted file: {target}")
+    print("OK" if success else "ERROR")
+    return success
+
+
+def make_highlighted_bystate(
+    readera_backup_filename, working_directory, data_path, with_keywords, state
+):
+    infos = get_all_citations(readera_backup_filename, state)
+    for book_info in sorted(infos.values(), key=lambda b: b.title):
+        if book_info.citations:
+            print(book_info.filename)
+            make_highlighted_pdf(
+                readera_backup_filename,
+                book_info.filename,
+                working_directory,
+                data_path,
+                with_keywords,
+                state,
+            )
+
+
+# ------------------------------------------------------------------- CLI ---
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Readera Highlighter")
+    parser.add_argument(
+        "--verify-citations-complete",
+        action="store_true",
+        help="check all backup files and show which citations are missing",
+    )
+    parser.add_argument(
+        "--show-titles", action="store_true", help="show all books with citations"
+    )
+    parser.add_argument("--add-highlights", help="add highlights from ReadEra backup")
+    parser.add_argument(
+        "--add-highlights-bystate",
+        action="store_true",
+        help="add highlights for books filtered by --state",
+    )
+    parser.add_argument("--show-citations", help="show citations for a book")
+    parser.add_argument(
+        "--readera-backup-path",
+        default=".",
+        help="directory with ReadEra .bak files (default: current)",
+    )
+    parser.add_argument(
+        "--readera-data-path",
+        default=".",
+        help="directory with ReadEra book files (default: current)",
+    )
+    parser.add_argument(
+        "--working-directory",
+        default=".",
+        help="directory for output files (default: current)",
+    )
+    parser.add_argument(
+        "--with-keywords",
+        action="store_true",
+        default=False,
+        help="write output to a copy with the '__note' suffix",
+    )
+    parser.add_argument(
+        "--state",
+        choices=["all", "readed"],
+        default="all",
+        help="filter books by reading state",
+    )
+    parser.add_argument("--debug", action="store_true", help="dump book text")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.verify_citations_complete:
+        verify_citations_complete(args.readera_backup_path)
+        return
+
+    backup = find_backup_path(args.readera_backup_path)
+    if backup is None:
         sys.exit(1)
+    print(f"Using {backup}")
 
-    book_filename_keyword = Path(str(book_filename)).with_stem(Path(str(book_filename)).stem+'__note')
-
-    # Check if file exist
-    # Check in working directory
-    for root, dirnames, filenames in os.walk(os.path.expanduser(args.working_directory)):
-        for f in filenames:
-            if f == str(book_filename):
-                if (args.with_keywords):
-                    shutil.copy(book_filename, book_filename_keyword)
-                    success = add_citations_to_pdf(book_filename_keyword, book_info.citations)
-                else:
-                    success = add_citations_to_pdf(book_filename, book_info.citations)
-                print(f"Produced highlighted file: {book_filename}")
-                if success:
-                    print('OK')
-                    return
-                else:
-                    print('ERROR')
-                    sys.exit(1)
-
-    # Check in readera's data path
-    for root, dirnames, filenames in os.walk(os.path.expanduser(args.readera_data_path)):
-        for f in filenames:
-            if f == str(book_filename):
-                print(os.path.join(root, f))
-                shutil.copy(os.path.join(root, f), os.path.expanduser(args.working_directory))
-
-                if (args.with_keywords):
-                    shutil.copy(book_filename, book_filename_keyword)
-                    success = add_citations_to_pdf(book_filename_keyword, book_info.citations)
-                else:
-                    success = add_citations_to_pdf(book_filename, book_info.citations)
-
-                print(f"Produced highlighted file: {book_filename}")
-                if success:
-                    print('OK')
-                else:
-                    print('ERROR')
-                    sys.exit(1)
-
-# Parsing
-parser = argparse.ArgumentParser(description="Readera Highlighter")
-
-parser.add_argument(
-    '--verify-citations-complete',
-    action = 'store_true',
-    help = 'checks all backup files in the backup directory and shows which have all citations'
-)
-
-parser.add_argument(
-    '--show-titles',
-    action = 'store_true',
-    help = 'show all books with citations'
-)
-
-parser.add_argument(
-    '--add-highlights',
-    help = 'add highlights from ReadEra backup'
-)
-
-parser.add_argument(
-    '--add-highlights-bystate',
-    action = 'store_true',
-    help = 'add highlights from ReadEra backup based on state'
-)
-
-parser.add_argument(
-    '--show-citations',
-    help = 'show citations'
-)
-
-parser.add_argument(
-    '--readera-backup-path',
-    default = '.',
-    help = 'path for backup files of Readera; the current directory by default'
-)
-
-parser.add_argument(
-    '--readera-data-path',
-    default = '.',
-    help = 'path for data files of Readera; the current directory by default'
-)
-
-parser.add_argument(
-    '--working-directory',
-    default = '.',
-    help = 'path for working book files; the current directory by default'
-)
-
-parser.add_argument(
-    '--with-keywords',
-    action = 'store_true',
-    default = 'true',
-    help = 'add keyword to filename'
-)
-
-parser.add_argument(
-    '--state',
-    choices = ['all', 'readed'],
-    # default = 'all',
-    help = 'state of book'
-)
-
-args = parser.parse_args()
-print(args) # DEBUG
-
-if args.verify_citations_complete == 1:
-    verify_citations_complete()
-else:
-    readera_backup_filename = os.getenv('READERA_BACKUP')
-    if readera_backup_filename is None:
-        readera_backup_filenames = tuple(Path(os.path.expanduser(args.readera_backup_path)).glob('ReadEra*.bak'))
-        if len(readera_backup_filenames) == 0:
-            print('Did not find any ReadEra backup in current directory')
-            sys.exit(1)
-        else:
-            readera_backup_filename = max(readera_backup_filenames, key=lambda f: f.stat().st_mtime)
-    print(f"Using {readera_backup_filename}")
     if args.show_titles:
-        show_titles(readera_backup_filename)
+        show_titles(backup, args.state)
     elif args.show_citations is not None:
-        book_title = args.show_citations
-        show_citations_for_book(readera_backup_filename, book_title)
+        show_citations_for_book(backup, args.show_citations, args.state)
     elif args.add_highlights is not None:
-        book_filename = args.add_highlights
-        make_highlighted_pdf(readera_backup_filename, book_filename)
+        ok = make_highlighted_pdf(
+            backup,
+            args.add_highlights,
+            args.working_directory,
+            args.readera_data_path,
+            args.with_keywords,
+            args.state,
+        )
+        sys.exit(0 if ok else 1)
     elif args.add_highlights_bystate:
-        make_highlighted_bystate(readera_backup_filename)
+        make_highlighted_bystate(
+            backup,
+            args.working_directory,
+            args.readera_data_path,
+            args.with_keywords,
+            args.state,
+        )
     else:
-        sys.exit(1)
+        sys.exit("No action selected. Use --help.")
+
+
+if __name__ == "__main__":
+    main()
