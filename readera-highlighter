@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Readera Highlighter: перенос цитат и заметок из бэкапа ReadEra
+в файлы книг (встраивание в EPUB через <mark>, генерация для Foliate и org-noter)."""
 
 import argparse
+import base64
+import hashlib
 import json
 import os
-import posixpath
 import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
+from urllib.parse import unquote
+from xml.etree import ElementTree as ET
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
-import pymupdf as fitz  # современный импорт без FutureWarning
+import pymupdf as fitz
 
-# ----------------------------------------------------------------- модели ---
+# ──────────────────────────────────────────────────────────────────────────────
+#  Модели
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -25,20 +34,19 @@ class BookInfo:
     citations: set = field(default_factory=set)
 
 
-# --------------------------------------------------- чтение бэкапов ---
+# ──────────────────────────────────────────────────────────────────────────────
+#  Чтение бэкапов
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def find_library_data_in_zip(zf):
     names = zf.namelist()
-
-    # Старый формат: один library.json
     if "library.json" in names:
         return ("single", "library.json")
     for name in names:
         if name.endswith("/library.json") or name.endswith("\\library.json"):
             return ("single", name)
 
-    # Новый формат: фрагменты docs_N.json
     docs_files = []
     for name in names:
         basename = name.split("/")[-1].split("\\")[-1]
@@ -71,13 +79,11 @@ def load_library_data(zf, library_info):
         return None
 
     fmt, data = library_info
-
     if fmt == "single":
         with zf.open(data) as f:
             return json.load(f)
 
-    elif fmt == "split":
-        # Каждый docs_N.json — самостоятельный JSON-массив объектов.
+    if fmt == "split":
         all_docs = []
         for filename in data:
             with zf.open(filename) as f:
@@ -112,8 +118,7 @@ def get_all_citations(readera_backup_filename, state="all"):
         library_info = find_library_data_in_zip(backup_file)
         if library_info is None:
             raise FileNotFoundError(
-                f"No library data found in {readera_backup_filename}. "
-                "Expected library.json or docs_*.json files."
+                f"No library data found in {readera_backup_filename}."
             )
 
         fmt, data = library_info
@@ -130,7 +135,6 @@ def get_all_citations(readera_backup_filename, state="all"):
 
     for doc in library_data.get("docs", []):
         doc_data = doc.get("data", {})
-
         if state == "readed" and not doc_data.get("doc_have_read_time", 0):
             continue
 
@@ -173,16 +177,16 @@ def find_backup_path(backup_path):
     return max(candidates, key=lambda f: f.stat().st_mtime)
 
 
-# ---------------------------------------------------------------- режимы ---
+# ──────────────────────────────────────────────────────────────────────────────
+#  Режимы просмотра
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def verify_citations_complete(backup_path):
     all_infos = {}
     backups_to_map = {}
-
     for filename in sorted(
-        Path(os.path.expanduser(backup_path)).glob("ReadEra*bak"),
-        reverse=True,
+        Path(os.path.expanduser(backup_path)).glob("ReadEra*bak"), reverse=True
     ):
         infos = get_all_citations(filename)
         backups_to_map[filename] = infos
@@ -226,16 +230,13 @@ def get_citations_by_file(readera_backup_filename, book_filename, state="all"):
 
 def show_citations_for_book(readera_backup_filename, book, state="all"):
     if Path(book).is_file():
-        print(f"Searching for file '{book}'")
         book_info = get_citations_by_file(
             readera_backup_filename, Path(book).name, state
         )
     else:
-        print(f"Searching for title '{book}'")
         infos = get_all_citations(readera_backup_filename, state)
         book_info = next(
-            (b for b in infos.values() if book.lower() in b.title.lower()),
-            None,
+            (b for b in infos.values() if book.lower() in b.title.lower()), None
         )
 
     if not book_info:
@@ -247,27 +248,38 @@ def show_citations_for_book(readera_backup_filename, book, state="all"):
         print(f"- {citation[0]}\n")
 
 
-# -------------------------------------------------------- токенизация ---
+# ──────────────────────────────────────────────────────────────────────────────
+#  Общие утилиты
+# ──────────────────────────────────────────────────────────────────────────────
 
-LANGS = [
-    "ÁáČčĎďÉéĚěÍíŇňÓóŘřŠšŤťÚúŮůÝýŽž",  # Czech
-    "ÄäÖöÜüẞß",  # German
-    "ĄąĆćĘęŁłŃńÓóŚśŹźŻż",  # Polish
-    "À-ú",  # Portuguese
-    "Ёё",  # Russian
-]
-TOKEN_RE = re.compile(r"[A-Za-zА-Яа-я0-9!?.,;:'\"" + "".join(LANGS) + "]")
-
-
-def tokenize(text):
-    return TOKEN_RE.findall(text)
+_INVISIBLE = "\u00ad\u200b\ufeff\u2060"
+_SPECIAL_SPACES = "\u00a0\u2007\u202f\u2009\u200a\u2002\u2003"
 
 
 def _normalize_ws(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-# ------------------------------------------------------- PDF-подсветка ---
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PDF-подсветка
+# ──────────────────────────────────────────────────────────────────────────────
+
+LANGS = [
+    "ÁáČčĎďÉéĚěÍíŇňÓóŘřŠšŤťÚúŮůÝýŽž",
+    "ÄäÖöÜüẞß",
+    "ĄąĆćĘęŁłŃńÓóŚśŹźŻż",
+    "À-ú",
+    "Ёё",
+]
+TOKEN_RE = re.compile(r"[A-Za-zА-Яа-я0-9!?.,;:'\"" + "".join(LANGS) + "]")
+
+
+def tokenize(text):
+    return TOKEN_RE.findall(text)
 
 
 def build_text_index(doc):
@@ -304,26 +316,21 @@ def remove_existing_highlights(doc):
 def _add_highlights_to_pdf(doc_filename, citations):
     doc = fitz.open(doc_filename)
     num_found = num_not_found = 0
-
     try:
         remove_existing_highlights(doc)
         text, records = build_text_index(doc)
         search_from = 0
-
         for citation, _, note in sorted(citations, key=lambda item: item[1]):
             for part in citation.split("\n"):
                 needle = "".join(tokenize(part))
                 if not needle:
                     continue
-
                 pos = text.find(needle, search_from)
                 if pos < 0:
                     pos = text.find(needle)
-
                 if pos < 0:
                     num_not_found += 1
                     continue
-
                 groups = []
                 for page_index, rect, line_key in records[pos : pos + len(needle)]:
                     key = (page_index, line_key)
@@ -331,294 +338,330 @@ def _add_highlights_to_pdf(doc_filename, citations):
                         groups[-1][1] |= rect
                     else:
                         groups.append([key, fitz.Rect(rect)])
-
                 for (page_index, _), rect in groups:
                     page = doc[page_index]
                     annot = page.add_highlight_annot(rect)
                     if note:
                         annot.set_info(content=note)
                     annot.update()
-
                 search_from = pos + len(needle)
                 num_found += 1
-
         if num_found:
             doc.saveIncr()
     finally:
         doc.close()
-
     print(f"  Citations found: {num_found}")
     if num_not_found:
         print(f"  Citations not found: {num_not_found}")
     return num_found, num_not_found
 
 
-# ------------------------------------------------------- EPUB-подсветка ---
-
-HIGHLIGHT_CSS = """
-/* === ReadEra Highlighter === */
-mark.readera-hl {
-    background-color: #FFF176;
-    color: inherit;
-    padding: 0;
-    border-radius: 2px;
-    -webkit-box-decoration-break: clone;
-    box-decoration-break: clone;
-}
-"""
-
-_MARK_RE = re.compile(
-    r'<mark\s+class="readera-hl"[^>]*>(.*?)</mark>',
-    re.DOTALL | re.IGNORECASE,
-)
-
-# Невидимые символы, которые нужно убрать при сравнении
-_INVISIBLE = "\u00ad\u200b\ufeff\u2060"
-_SPECIAL_SPACES = "\u00a0\u2007\u202f\u2009\u200a\u2002\u2003"
-
-
-def _is_xhtml(name):
-    if "META-INF" in name:
-        return False
-    return name.lower().endswith((".xhtml", ".html", ".htm"))
-
-
-def _extract_text_nodes(html_content):
-    """Возвращает диапазоны (старт, конец) текстовых сегментов между тегами."""
-    nodes = []
-    pos = 0
-    for m in re.finditer(r"<[^>]*>", html_content):
-        tag_start, tag_end = m.span()
-        if tag_start > pos:
-            segment = html_content[pos:tag_start]
-            if segment.strip():
-                nodes.append((pos, tag_start))
-        pos = tag_end
-    if pos < len(html_content):
-        segment = html_content[pos:]
-        if segment.strip():
-            nodes.append((pos, len(html_content)))
-    return nodes
-
-
-def _build_norm_index(html_content):
-    """
-    Строит нормализованный видимый текст и маппинг позиций на оригинал.
-    Возвращает (norm_text, norm_map), где norm_map[i] — позиция в оригинале.
-    """
-    nodes = _extract_text_nodes(html_content)
-    visible_chars = []
-    pos_map = []
-    for start, end in nodes:
-        segment = html_content[start:end]
-        for i, ch in enumerate(segment):
-            visible_chars.append(ch)
-            pos_map.append(start + i)
-
-    norm_chars = []
-    norm_map = []
-    prev_space = False
-    for ch, orig_pos in zip(visible_chars, pos_map):
-        if ch in _INVISIBLE:
-            continue
-        if ch in _SPECIAL_SPACES or ch in "\n\r\t":
-            ch = " "
-        if ch == " ":
-            if prev_space:
-                continue
-            prev_space = True
-        else:
-            prev_space = False
-        norm_chars.append(ch)
-        norm_map.append(orig_pos)
-
-    return "".join(norm_chars), norm_map
-
-
-def _find_citation_in_html(html_content, citation_text, index_cache=None):
-    """
-    Ищет цитату в HTML. Возвращает (старт, конец) в оригинале или None.
-    index_cache позволяет переиспользовать индекс для одного файла.
-    """
-    if index_cache is not None:
-        norm_text, norm_map, token_index = index_cache
-    else:
-        norm_text, norm_map = _build_norm_index(html_content)
-        token_index = None
-
-    # 1. Точный поиск нормализованной цитаты
-    cleaned = re.sub(f"[{re.escape(_INVISIBLE)}]", "", citation_text)
-    norm_citation = _normalize_ws(cleaned)
-    if norm_citation:
-        idx = norm_text.find(norm_citation)
-        if idx != -1 and idx + len(norm_citation) <= len(norm_map):
-            orig_start = norm_map[idx]
-            orig_end = norm_map[idx + len(norm_citation) - 1] + 1
-            return orig_start, orig_end
-
-    # 2. Токенизационный поиск (нечувствителен к пунктуации и переносам)
-    cit_tokens = tokenize(citation_text)
-    if not cit_tokens:
-        return None
-
-    if token_index is None:
-        token_index = [
-            (m.group(), m.start(), m.end()) for m in TOKEN_RE.finditer(norm_text)
-        ]
-
-    if len(cit_tokens) > len(token_index):
-        return None
-
-    n = len(cit_tokens)
-    first = cit_tokens[0]
-    for i in range(len(token_index) - n + 1):
-        if token_index[i][0] != first:
-            continue
-        if all(token_index[i + j][0] == cit_tokens[j] for j in range(1, n)):
-            norm_start = token_index[i][1]
-            norm_end = token_index[i + n - 1][2]
-            if norm_end <= len(norm_map):
-                orig_start = norm_map[norm_start]
-                orig_end = norm_map[norm_end - 1] + 1
-                return orig_start, orig_end
-
-    return None
-
-
-def _tags_balanced(fragment):
-    """Проверяет сбалансированность тегов во фрагменте (через стек)."""
-    VOID_TAGS = {
-        "br",
-        "hr",
-        "img",
-        "input",
-        "meta",
-        "link",
-        "area",
-        "base",
-        "col",
-        "embed",
-        "source",
-        "track",
-        "wbr",
-    }
-    stack = []
-    for m in re.finditer(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*?)(/?)>", fragment):
-        closing, tag, _, self_close = m.groups()
-        tag = tag.lower()
-        if tag in VOID_TAGS or self_close == "/":
-            continue
-        if closing:
-            if not stack or stack[-1] != tag:
-                return False
-            stack.pop()
-        else:
-            stack.append(tag)
-    return not stack
-
-
-def _escape_attr(text):
-    if not text:
-        return ""
-    return (
-        text.replace("&", "&amp;")
-        .replace('"', "&quot;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-def _insert_marks(html_text, spans):
-    """Вставляет <mark> по диапазонам. Вставка с конца, чтобы не смещать позиции."""
-    spans = sorted(spans, key=lambda s: s[0])
-    # Убираем пересечения и несбалансированные фрагменты
-    filtered = []
-    last_end = -1
-    for start, end, note in spans:
-        if start < last_end:
-            continue
-        if not _tags_balanced(html_text[start:end]):
-            continue
-        filtered.append((start, end, note))
-        last_end = end
-
-    for start, end, note in reversed(filtered):
-        note_attr = f' data-note="{_escape_attr(note)}"' if note else ""
-        html_text = html_text[:end] + "</mark>" + html_text[end:]
-        html_text = (
-            html_text[:start]
-            + f'<mark class="readera-hl"{note_attr}>'
-            + html_text[start:]
+def book_to_pdf(book_filename, pdf_filename):
+    if shutil.which("ebook-convert") is None:
+        raise RuntimeError(
+            f"ebook-convert not found. Install Calibre to convert {book_filename} to PDF."
         )
-    return html_text
+    subprocess.check_call(["ebook-convert", str(book_filename), str(pdf_filename)])
 
 
-def _remove_epub_highlights_in_html(html_text):
-    new_text, count = _MARK_RE.subn(r"\1", html_text)
-    return new_text, count
+# ──────────────────────────────────────────────────────────────────────────────
+#  Генератор EPUB CFI
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-def _relative_path(from_file, to_file):
-    from_dir = posixpath.dirname(from_file)
-    return posixpath.relpath(to_file, from_dir)
+class EpubCfiGenerator:
+    def __init__(self, epub_path):
+        self.epub_path = Path(epub_path)
+        self.opf_path = None
+        self.opf_dir = ""
+        self.manifest = {}
+        self.spine = []
+        self._parse_opf()
 
+    def _parse_opf(self):
+        with ZipFile(self.epub_path) as zf:
+            try:
+                container_xml = zf.read("META-INF/container.xml")
+                root = ET.fromstring(container_xml)
+                ns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+                rootfile = root.find(".//c:rootfile", ns)
+                if rootfile is None:
+                    rootfile = root.find(".//rootfile")
+                if rootfile is not None:
+                    self.opf_path = rootfile.get("full-path")
+            except (KeyError, ET.ParseError):
+                for name in zf.namelist():
+                    if name.endswith(".opf"):
+                        self.opf_path = name
+                        break
+            if self.opf_path is None:
+                return
+            self.opf_dir = str(Path(self.opf_path).parent)
+            if self.opf_dir == ".":
+                self.opf_dir = ""
+            opf_xml = zf.read(self.opf_path)
+            root = ET.fromstring(opf_xml)
+            for elem in root.iter():
+                tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                if tag == "item":
+                    item_id = elem.get("id")
+                    href = elem.get("href", "")
+                    if item_id and href:
+                        self.manifest[item_id] = {"href": unquote(href)}
+            spine_elem = None
+            for elem in root.iter():
+                tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                if tag == "spine":
+                    spine_elem = elem
+                    break
+            if spine_elem is not None:
+                for i, elem in enumerate(spine_elem):
+                    tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                    if tag == "itemref":
+                        itemref_id = elem.get("id") or f"itemref_{i}"
+                        idref = elem.get("idref", "")
+                        if idref:
+                            self.spine.append((itemref_id, idref))
 
-def _add_to_opf_manifest(contents, names, css_name):
-    opf_files = [n for n in names if n.lower().endswith(".opf")]
-    if not opf_files:
-        return
-    opf_name = opf_files[0]
-    opf_text = contents[opf_name].decode("utf-8", errors="replace")
-    if css_name in opf_text:
-        return
-    rel = posixpath.relpath(css_name, posixpath.dirname(opf_name))
-    item = f'<item id="readera-hl-css" href="{rel}" media-type="text/css"/>'
-    if "</manifest>" in opf_text:
-        opf_text = opf_text.replace("</manifest>", item + "</manifest>", 1)
-        contents[opf_name] = opf_text.encode("utf-8")
+    def get_book_identifier(self):
+        with ZipFile(self.epub_path) as zf:
+            if self.opf_path:
+                try:
+                    opf_xml = zf.read(self.opf_path)
+                    root = ET.fromstring(opf_xml)
+                    for elem in root.iter():
+                        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                        if tag == "identifier":
+                            text = (elem.text or "").strip()
+                            if text:
+                                return text
+                except (KeyError, ET.ParseError):
+                    pass
+            md5 = hashlib.md5()
+            with open(self.epub_path, "rb") as f:
+                remaining = 10_000_000
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    md5.update(chunk)
+                    remaining -= len(chunk)
+            return f"foliate:{md5.hexdigest()}"
 
+    def _build_cfi_index(self, html_content):
+        try:
+            html_content = re.sub(r'\s+xmlns\s*=\s*"[^"]*"', "", html_content, count=1)
+            root = ET.fromstring(html_content)
+        except ET.ParseError:
+            return []
+        index = []
 
-def _inject_highlight_css(contents, names):
-    css_files = [n for n in names if n.lower().endswith(".css")]
-    if css_files:
-        css_file = css_files[0]
-        existing = contents[css_file].decode("utf-8", errors="replace")
-        if "readera-hl" not in existing:
-            contents[css_file] = (existing + HIGHLIGHT_CSS).encode("utf-8")
-        return
+        def walk(elem, parent_steps):
+            nodes = []
+            if elem.text is not None:
+                nodes.append(("text", elem.text))
+            for child in elem:
+                nodes.append(("elem", child))
+                if child.tail is not None:
+                    nodes.append(("text", child.tail))
+            elem_counter = 0
+            text_counter = 0
+            for node_type, node_value in nodes:
+                if node_type == "elem":
+                    elem_counter += 1
+                    tag = (
+                        node_value.tag.split("}")[-1]
+                        if "}" in node_value.tag
+                        else node_value.tag
+                    )
+                    step = (elem_counter * 2, tag, node_value.get("id"))
+                    walk(node_value, parent_steps + [step])
+                else:
+                    text_counter += 1
+                    if node_value:
+                        text_steps = parent_steps + [(text_counter * 2 - 1, None, None)]
+                        for char_offset, char in enumerate(node_value):
+                            index.append((list(text_steps), char_offset, char))
 
-    css_name = "readera-highlights.css"
-    if css_name in names:
-        return
-    contents[css_name] = HIGHLIGHT_CSS.encode("utf-8")
-    names.append(css_name)
+        walk(root, [])
+        return index
 
-    for name in list(names):
-        if not _is_xhtml(name):
-            continue
-        html_text = contents[name].decode("utf-8", errors="replace")
-        rel = _relative_path(name, css_name)
-        link_tag = f'<link rel="stylesheet" type="text/css" href="{rel}"/>'
-        if "</head>" in html_text:
-            html_text = html_text.replace("</head>", link_tag + "</head>", 1)
-        elif "<body" in html_text:
-            html_text = html_text.replace("<body", link_tag + "<body", 1)
+    def _locate_citation(self, zf, citation_text, debug=False):
+        norm_citation = _normalize_ws(citation_text)
+        if not norm_citation:
+            return None
+        if debug:
+            print(f"  [DEBUG] Ищем: {norm_citation[:80]!r}")
+        for spine_idx, (itemref_id, idref) in enumerate(self.spine):
+            item = self.manifest.get(idref)
+            if not item:
+                continue
+            href = item["href"]
+            full_path = f"{self.opf_dir}/{href}" if self.opf_dir else href
+            html_content = None
+            for p in [full_path, href]:
+                try:
+                    html_content = zf.read(p).decode("utf-8", errors="replace")
+                    break
+                except KeyError:
+                    continue
+            if html_content is None:
+                if debug:
+                    print(f"  [DEBUG]   {href}: файл не найден")
+                continue
+            index = self._build_cfi_index(html_content)
+            if not index:
+                if debug:
+                    print(f"  [DEBUG]   {href}: индекс пуст")
+                continue
+            full_text = "".join(ch for _, _, ch in index)
+            norm_full = _normalize_ws(full_text)
+            if debug and spine_idx < 2:
+                print(f"  [DEBUG]   {href}: {len(full_text)} символов")
+                print(f"  [DEBUG]   Начало текста: {norm_full[:150]!r}")
+            pos = norm_full.find(norm_citation)
+            if pos < 0:
+                continue
+            if debug:
+                print(f"  [DEBUG]   НАЙДЕНО в {href} на позиции {pos}")
+            norm_to_orig = []
+            prev_space = False
+            for i, (_, _, ch) in enumerate(index):
+                if ch in _INVISIBLE:
+                    continue
+                mapped_ch = " " if (ch in _SPECIAL_SPACES or ch in "\n\r\t") else ch
+                if mapped_ch == " ":
+                    if prev_space:
+                        continue
+                    prev_space = True
+                else:
+                    prev_space = False
+                norm_to_orig.append(i)
+            end_pos = pos + len(norm_citation)
+            if pos >= len(norm_to_orig) or end_pos > len(norm_to_orig):
+                continue
+            start_orig = norm_to_orig[pos]
+            end_orig = norm_to_orig[end_pos - 1]
+            start_steps, start_offset, _ = index[start_orig]
+            end_steps, end_offset, _ = index[end_orig]
+            return (
+                spine_idx,
+                itemref_id,
+                href,
+                start_steps,
+                start_offset,
+                end_steps,
+                end_offset,
+            )
+        if debug:
+            print(f"  [DEBUG]   НЕ НАЙДЕНО")
+        return None
+
+    def _steps_to_path(self, steps):
+        parts = []
+        for step in steps:
+            idx = step[0]
+            elem_id = step[2] if len(step) > 2 else None
+            if elem_id:
+                parts.append(f"/{idx}[{elem_id}]")
+            else:
+                parts.append(f"/{idx}")
+        return "".join(parts)
+
+    def _build_range_cfi(
+        self, spine_num, itemref_id, start_steps, start_offset, end_steps, end_offset
+    ):
+        if itemref_id:
+            base = f"/6/{spine_num}[{itemref_id}]!"
         else:
-            html_text = link_tag + html_text
-        contents[name] = html_text.encode("utf-8")
+            base = f"/6/{spine_num}!"
+        common = []
+        for a, b in zip(start_steps[:-1], end_steps[:-1]):
+            if a[0] == b[0]:
+                common.append(a)
+            else:
+                break
+        parent_path = self._steps_to_path(common)
+        start_sub = self._steps_to_path(start_steps[len(common) :]) + f":{start_offset}"
+        end_sub = self._steps_to_path(end_steps[len(common) :]) + f":{end_offset}"
+        return f"epubcfi({base}{parent_path},{start_sub},{end_sub})"
 
-    _add_to_opf_manifest(contents, names, css_name)
+    def find_cfi_for_citation(self, zf, citation_text):
+        loc = self._locate_citation(zf, citation_text)
+        if not loc:
+            return None
+        spine_idx, itemref_id, href, s_steps, s_off, e_steps, e_off = loc
+        return self._build_range_cfi(
+            (spine_idx + 1) * 2, itemref_id, s_steps, s_off, e_steps, e_off + 1
+        )
+
+    def find_citation_location(self, zf, citation_text):
+        loc = self._locate_citation(zf, citation_text)
+        if not loc:
+            return None
+        spine_idx, itemref_id, href, s_steps, s_off, e_steps, e_off = loc
+        return {
+            "spine_index": spine_idx,
+            "spine_name": href,
+            "start_cfi": self._steps_to_path(s_steps) + f":{s_off}",
+            "end_cfi": self._steps_to_path(e_steps) + f":{e_off + 1}",
+        }
 
 
-def _write_epub(epub_path, names, contents):
-    """Записывает EPUB. mimetype — первым и без сжатия (требование спецификации)."""
-    ordered = []
-    if "mimetype" in names:
-        ordered.append("mimetype")
-    for n in names:
-        if n != "mimetype":
-            ordered.append(n)
+# ──────────────────────────────────────────────────────────────────────────────
+#  Генерация аннотаций
+# ──────────────────────────────────────────────────────────────────────────────
 
+
+def generate_calibre_bookmarks(epub_path, citations):
+    generator = EpubCfiGenerator(epub_path)
+    entries = []
+    found_count = 0
+    not_found_count = 0
+    with ZipFile(epub_path) as zf:
+        for citation_body, position, note in sorted(citations, key=lambda x: x[1]):
+            for part in citation_body.split("\n"):
+                part = part.strip()
+                if not part:
+                    continue
+                loc = generator.find_citation_location(zf, part)
+                if loc:
+                    entry = {
+                        "type": "highlight",
+                        "uuid": str(uuid.uuid4()),
+                        "timestamp": _now_iso(),
+                        "spine_index": loc["spine_index"],
+                        "spine_name": loc["spine_name"],
+                        "start_cfi": loc["start_cfi"],
+                        "end_cfi": loc["end_cfi"],
+                        "highlighted_text": part,
+                        "style": {
+                            "kind": "color",
+                            "type": "builtin",
+                            "which": "yellow",
+                        },
+                    }
+                    if note:
+                        entry["notes"] = note
+                    entries.append(entry)
+                    found_count += 1
+                else:
+                    not_found_count += 1
+    if not entries:
+        return None, 0, 0
+    json_str = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    b64 = base64.b64encode(json_str.encode("utf-8")).decode("ascii")
+    return "encoding=json+base64:" + b64, found_count, not_found_count
+
+
+def embed_calibre_bookmarks(epub_path, bookmarks_content):
+    with ZipFile(epub_path) as zin:
+        contents = {n: zin.read(n) for n in zin.namelist()}
+    contents["META-INF/calibre_bookmarks.txt"] = bookmarks_content.encode("utf-8")
+    names = list(contents.keys())
+    ordered = (["mimetype"] if "mimetype" in names else []) + [
+        n for n in names if n != "mimetype"
+    ]
     with ZipFile(epub_path, "w", ZIP_DEFLATED) as zout:
         for name in ordered:
             if name == "mimetype":
@@ -627,164 +670,252 @@ def _write_epub(epub_path, names, contents):
                 zout.writestr(name, contents[name])
 
 
-def add_highlights_to_epub(epub_path, citations):
-    """
-    Добавляет подсветку в EPUB, оборачивая цитаты в <mark> теги.
-    Возвращает (число_найденных, число_не_найденных).
-    """
-    with ZipFile(epub_path) as zin:
-        names = zin.namelist()
-        contents = {n: zin.read(n) for n in names}
-
-    xhtml_files = [n for n in names if _is_xhtml(n)]
-    if not xhtml_files:
-        print("  No XHTML files found in EPUB")
-        return 0, 0
-
-    # 1. Защита от повторной подсветки + подготовка индексов
-    removed_total = 0
-    file_indexes = {}
-    for xf in xhtml_files:
-        html_text = contents[xf].decode("utf-8", errors="replace")
-        html_text, removed = _remove_epub_highlights_in_html(html_text)
-        removed_total += removed
-        contents[xf] = html_text.encode("utf-8")
-
-        norm_text, norm_map = _build_norm_index(html_text)
-        token_index = [
-            (m.group(), m.start(), m.end()) for m in TOKEN_RE.finditer(norm_text)
-        ]
-        file_indexes[xf] = (norm_text, norm_map, token_index)
-
-    if removed_total:
-        print(f"  Removed {removed_total} existing EPUB highlight(s)")
-
-    # 2. Собираем список частей цитат
-    citation_parts = []
-    for citation, _, note in sorted(citations, key=lambda item: item[1]):
-        for part in citation.split("\n"):
-            part = part.strip()
-            if part:
-                citation_parts.append((part, note))
-
-    # 3. Ищем каждую цитату во всех файлах
-    matches = {xf: [] for xf in xhtml_files}
+def generate_foliate_json(epub_path, citations, output_dir):
+    generator = EpubCfiGenerator(epub_path)
+    epub_name = Path(epub_path).stem
+    annotations = []
     found_count = 0
-    not_found = []
+    not_found_count = 0
+    with ZipFile(epub_path) as zf:
+        for citation_body, position, note in sorted(citations, key=lambda x: x[1]):
+            for part in citation_body.split("\n"):
+                part = part.strip()
+                if not part:
+                    continue
+                cfi = generator.find_cfi_for_citation(zf, part)
+                if cfi:
+                    annotations.append(
+                        {
+                            "value": cfi,
+                            "color": "yellow",
+                            "text": part,
+                            "note": note or "",
+                            "created": _now_iso(),
+                            "modified": _now_iso(),
+                        }
+                    )
+                    found_count += 1
+                else:
+                    not_found_count += 1
+    if not annotations:
+        return None, 0, 0
+    result = {"annotations": annotations}
+    output_path = Path(output_dir) / f"{epub_name}-foliate.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"  Foliate JSON: {found_count} аннотаций, {not_found_count} не найдено")
+    print(f"  Файл сохранён: {output_path}")
+    return output_path, found_count, not_found_count
 
-    for part, note in citation_parts:
-        found = False
-        for xf in xhtml_files:
-            html_text = contents[xf].decode("utf-8", errors="replace")
-            span = _find_citation_in_html(html_text, part, index_cache=file_indexes[xf])
-            if span:
-                matches[xf].append((span[0], span[1], note))
-                found = True
-                found_count += 1
-                break
-        if not found:
-            not_found.append(part)
 
-    # 4. Вставляем подсветки
-    for xf in xhtml_files:
-        if not matches[xf]:
-            continue
-        html_text = contents[xf].decode("utf-8", errors="replace")
-        html_text = _insert_marks(html_text, matches[xf])
-        contents[xf] = html_text.encode("utf-8")
-
+def generate_org_noter_notes(epub_path, citations, output_dir, book_title):
+    generator = EpubCfiGenerator(epub_path)
+    epub_name = Path(epub_path).stem
+    org_lines = []
+    org_lines.append(f"#+TITLE: Notes for {book_title}")
+    org_lines.append(f"#+AUTHOR: ReadEra Highlighter")
+    org_lines.append(f"#+DATE: {_now_iso()}")
+    org_lines.append("")
+    org_lines.append("* Notes")
+    org_lines.append("  :PROPERTIES:")
+    org_lines.append("  :NOTER_DOCUMENT: " + str(epub_path))
+    org_lines.append("  :END:")
+    org_lines.append("")
+    found_count = 0
+    not_found_count = 0
+    with ZipFile(epub_path) as zf:
+        for citation_body, position, note in sorted(citations, key=lambda x: x[1]):
+            for part in citation_body.split("\n"):
+                part = part.strip()
+                if not part:
+                    continue
+                cfi = generator.find_cfi_for_citation(zf, part)
+                if cfi:
+                    heading_text = part[:60].replace("\n", " ") + (
+                        "..." if len(part) > 60 else ""
+                    )
+                    org_lines.append(f"** {heading_text}")
+                    org_lines.append("   :PROPERTIES:")
+                    org_lines.append(f'   :NOTER_PAGE: (cfi "{cfi}")')
+                    org_lines.append("   :END:")
+                    org_lines.append("")
+                    org_lines.append("   #+begin_quote")
+                    for line in part.split("\n"):
+                        org_lines.append(f"   {line}")
+                    org_lines.append("   #+end_quote")
+                    org_lines.append("")
+                    if note:
+                        org_lines.append("   " + note.replace("\n", "\n   "))
+                        org_lines.append("")
+                    found_count += 1
+                else:
+                    not_found_count += 1
     if found_count == 0:
-        print("  No citations found in EPUB")
-        return 0, len(not_found)
-
-    # 5. CSS и запись
-    _inject_highlight_css(contents, names)
-    _write_epub(epub_path, names, contents)
-
-    print(f"  Citations highlighted: {found_count}")
-    if not_found:
-        print(f"  Citations not found: {len(not_found)}")
-        for p in not_found[:10]:
-            print(f"    - {p[:80]}")
-        if len(not_found) > 10:
-            print(f"    ... and {len(not_found) - 10} more")
-
-    return found_count, len(not_found)
+        return None, 0, 0
+    output_path = Path(output_dir) / f"{epub_name}_notes.org"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(org_lines))
+    print(f"  Org-noter: {found_count} аннотаций, {not_found_count} не найдено")
+    print(f"  Файл сохранён: {output_path}")
+    return output_path, found_count, not_found_count
 
 
-# ------------------------------------------------------ диспетчер ---
-
-SUPPORTED_NATIVE = {".pdf", ".epub"}
-
-
-def add_citations_to_document(doc_filename, citations):
+def embed_highlights_inline_epub(epub_path, citations):
     """
-    Добавляет подсветку в документ.
-    PDF и EPUB обрабатываются нативно, остальные форматы конвертируются в PDF.
-    Возвращает (успех, путь_к_результату).
+    Встраивает аннотации прямо в XHTML-файлы EPUB как теги <mark>.
+    Это гарантирует, что аннотации никогда не будут удалены читалкой.
     """
-    doc_path = Path(doc_filename)
-    ext = doc_path.suffix.lower()
-    output_path = doc_filename
+    generator = EpubCfiGenerator(epub_path)
+    found_count = 0
+    not_found_count = 0
 
-    if ext == ".epub":
-        num_found, num_not_found = add_highlights_to_epub(doc_filename, citations)
-    elif ext == ".pdf":
-        num_found, num_not_found = _add_highlights_to_pdf(doc_filename, citations)
-    else:
-        pdf_path = str(doc_path.with_suffix(".pdf"))
-        print(f"  Converting {doc_path.name} -> {Path(pdf_path).name}")
-        book_to_pdf(doc_filename, pdf_path)
-        output_path = pdf_path
-        num_found, num_not_found = _add_highlights_to_pdf(pdf_path, citations)
+    # 1. Читаем всё содержимое в память
+    with ZipFile(epub_path) as zin:
+        contents = {n: zin.read(n) for n in zin.namelist()}
 
-    return num_not_found == 0, output_path
+    xhtml_files = [
+        n
+        for n in contents
+        if n.endswith((".xhtml", ".html", ".htm")) and "META-INF" not in n
+    ]
+    css_added = False
+    css_content = b"""
+    mark.readera-hl {
+        background-color: #FFEB3B !important;
+        color: inherit !important;
+        border-radius: 2px;
+        padding: 0 2px;
+    }
+    """
+
+    # 2. Ищем цитаты (открываем архив заново для чтения, чтобы избежать блокировок)
+    with ZipFile(epub_path) as zin:
+        for citation_body, position, note in sorted(citations, key=lambda x: x[1]):
+            for part in citation_body.split("\n"):
+                part = part.strip()
+                if not part:
+                    continue
+
+                loc = generator._locate_citation(zin, part)
+                if not loc:
+                    not_found_count += 1
+                    continue
+
+                spine_idx, itemref_id, href, s_steps, s_off, e_steps, e_off = loc
+                target_file = None
+                for xf in xhtml_files:
+                    if href in xf or xf.endswith(href):
+                        target_file = xf
+                        break
+
+                if not target_file or target_file not in contents:
+                    not_found_count += 1
+                    continue
+
+                html_text = contents[target_file].decode("utf-8", errors="replace")
+                norm_part = re.sub(r"\s+", " ", part).strip()
+                words = norm_part.split()
+                if not words:
+                    continue
+
+                # Регулярное выражение, допускающее пробелы и HTML-теги между словами
+                pattern = r"\s*<?[^>]*>\s*".join(re.escape(w) for w in words)
+                match = re.search(pattern, html_text, re.IGNORECASE | re.DOTALL)
+
+                if match:
+                    matched_text = match.group(0)
+                    note_attr = f' title="{note}"' if note else ""
+                    replacement = (
+                        f'<mark class="readera-hl"{note_attr}>{matched_text}</mark>'
+                    )
+
+                    # Заменяем только первое вхождение
+                    html_text = html_text.replace(matched_text, replacement, 1)
+                    contents[target_file] = html_text.encode("utf-8")
+                    found_count += 1
+                    if not css_added:
+                        css_added = True
+                else:
+                    not_found_count += 1
+
+    # 3. Внедряем CSS в первый XHTML-файл
+    if css_added and xhtml_files:
+        first_xhtml = xhtml_files[0]
+        html_text = contents[first_xhtml].decode("utf-8", errors="replace")
+        if "</head>" in html_text:
+            html_text = html_text.replace(
+                "</head>", f'<style>{css_content.decode("utf-8")}</style></head>', 1
+            )
+            contents[first_xhtml] = html_text.encode("utf-8")
+
+    # 4. Перезаписываем EPUB (mimetype первым и без сжатия)
+    names = list(contents.keys())
+    ordered = (["mimetype"] if "mimetype" in names else []) + [
+        n for n in names if n != "mimetype"
+    ]
+
+    with ZipFile(epub_path, "w", ZIP_DEFLATED) as zout:
+        for name in ordered:
+            if name == "mimetype":
+                zout.writestr(name, contents[name], compress_type=ZIP_STORED)
+            else:
+                zout.writestr(name, contents[name])
+
+    return found_count, not_found_count
 
 
-def book_to_pdf(book_filename, pdf_filename):
-    if shutil.which("ebook-convert") is None:
-        raise RuntimeError(
-            "ebook-convert not found. Install Calibre to convert "
-            f"{book_filename} to PDF."
-        )
-    subprocess.check_call(["ebook-convert", str(book_filename), str(pdf_filename)])
+# ──────────────────────────────────────────────────────────────────────────────
+#  Сборка
+# ──────────────────────────────────────────────────────────────────────────────
+
+BOOK_EXTENSIONS = (
+    ".epub",
+    ".pdf",
+    ".fb2",
+    ".djvu",
+    ".mobi",
+    ".azw",
+    ".azw3",
+    ".cbz",
+    ".txt",
+    ".fb2.zip",
+)
 
 
-# ------------------------------------------------------- сборка ---
+def _is_book_file(path):
+    name = path.name.lower()
+    if name.endswith(".json") or name.endswith("-annotations.json"):
+        return False
+    for ext in BOOK_EXTENSIONS:
+        if name.endswith(ext):
+            return True
+    return False
 
 
 def locate_book(book_filename, working_directory, data_path, extra_names=None):
-    """
-    Ищет файл книги в рабочих директориях.
-    Пробует точное совпадение, затем альтернативные имена,
-    затем поиск по подстроке.
-    """
     wanted = Path(book_filename).name
-    # Список имён для точного поиска (основное + альтернативные)
     candidates = [wanted]
     if extra_names:
         for name in extra_names:
             if name and name not in candidates:
                 candidates.append(name)
-
     for directory in (working_directory, data_path):
         root = Path(os.path.expanduser(directory))
         if not root.is_dir():
             continue
-
-        # 1. Точное совпадение по каждому имени-кандидату
         for name in candidates:
             for found in root.rglob(name):
-                if found.is_file():
+                if found.is_file() and _is_book_file(found):
                     return found
-
-        # 2. Поиск по подстроке: имя книги без расширения внутри имени файла
-        stem = Path(wanted).stem  # название без расширения
-        if len(stem) >= 4:  # чтобы не искать по слишком коротким строкам
+        stem = Path(wanted).stem
+        if len(stem) >= 4:
             for found in root.iterdir():
-                if found.is_file() and stem.lower() in found.name.lower():
+                if (
+                    found.is_file()
+                    and _is_book_file(found)
+                    and stem.lower() in found.name.lower()
+                ):
                     return found
-
     return None
 
 
@@ -795,7 +926,6 @@ def make_highlighted_pdf(
     data_path=".",
     with_keywords=True,
     state="all",
-    epub_to_pdf=False,
 ):
     book_info = get_citations_by_file(readera_backup_filename, book_filename, state)
     if not book_info:
@@ -815,41 +945,56 @@ def make_highlighted_pdf(
         return False
 
     print(f"  Found: {found.name}")
-
+    file_ext = found.suffix.lower()
     workdir = Path(os.path.expanduser(working_directory))
     workdir.mkdir(parents=True, exist_ok=True)
+
+    if file_ext == ".epub":
+        target = workdir / found.name
+        if with_keywords and not target.stem.endswith("__note"):
+            target = target.with_stem(target.stem + "__note")
+        shutil.copy2(found, target)
+
+        print(f"  Встраивание подсветки в текст {target.name}...")
+        n_inline, n_not_found_inline = embed_highlights_inline_epub(
+            str(target), book_info.citations
+        )
+
+        foliate_json_path, n_foliate, _ = generate_foliate_json(
+            str(target), book_info.citations, str(workdir)
+        )
+        org_noter_path, n_org, _ = generate_org_noter_notes(
+            str(target), book_info.citations, str(workdir), book_info.title
+        )
+
+        print(f"OK: {target.name}")
+        print(f"  ✓ Подсвечено в тексте: {n_inline}")
+        if foliate_json_path:
+            print(f"  ✓ Foliate JSON: {foliate_json_path.name}")
+        if org_noter_path:
+            print(f"  ✓ Org-noter файл: {org_noter_path.name}")
+        if n_not_found_inline > 0:
+            print(f"  ! Не найдено в тексте: {n_not_found_inline}")
+        return True
 
     target = workdir / found.name
     if with_keywords and not target.stem.endswith("__note"):
         target = target.with_stem(target.stem + "__note")
-
-    file_ext = found.suffix.lower()
-
-    # Определяем, нужно ли конвертировать в PDF
-    need_convert = file_ext not in SUPPORTED_NATIVE
-    if file_ext == ".epub" and epub_to_pdf:
-        need_convert = True
-
-    if need_convert:
+    if file_ext != ".pdf":
         target = target.with_suffix(".pdf")
         print(f"  Converting {found.name} -> {target.name}")
         book_to_pdf(found, target)
     else:
         shutil.copy2(found, target)
 
-    success, target = add_citations_to_document(str(target), book_info.citations)
+    num_found, num_not_found = _add_highlights_to_pdf(str(target), book_info.citations)
     print(f"Produced highlighted file: {target}")
-    print("OK" if success else "ERROR")
-    return success
+    print("OK" if num_found else "ERROR")
+    return num_found > 0
 
 
 def make_highlighted_bystate(
-    readera_backup_filename,
-    working_directory,
-    data_path,
-    with_keywords,
-    state,
-    epub_to_pdf,
+    readera_backup_filename, working_directory, data_path, with_keywords, state
 ):
     infos = get_all_citations(readera_backup_filename, state)
     for book_info in sorted(infos.values(), key=lambda b: b.title):
@@ -862,11 +1007,12 @@ def make_highlighted_bystate(
                 data_path,
                 with_keywords,
                 state,
-                epub_to_pdf,
             )
 
 
-# ---------------------------------------------------------------- CLI ---
+# ──────────────────────────────────────────────────────────────────────────────
+#  CLI
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def parse_args():
@@ -874,7 +1020,7 @@ def parse_args():
     parser.add_argument(
         "--verify-citations-complete",
         action="store_true",
-        help="check all backup files and show which citations are missing",
+        help="check all backup files",
     )
     parser.add_argument(
         "--show-titles", action="store_true", help="show all books with citations"
@@ -887,26 +1033,19 @@ def parse_args():
     )
     parser.add_argument("--show-citations", help="show citations for a book")
     parser.add_argument(
-        "--readera-backup-path",
-        default=".",
-        help="directory with ReadEra .bak files (default: current)",
+        "--readera-backup-path", default=".", help="directory with ReadEra .bak files"
     )
     parser.add_argument(
-        "--readera-data-path",
-        default=".",
-        help="directory with ReadEra book files (default: current)",
+        "--readera-data-path", default=".", help="directory with ReadEra book files"
     )
     parser.add_argument(
-        "--working-directory",
-        default=".",
-        help="directory for output files (default: current)",
+        "--working-directory", default=".", help="directory for output files"
     )
     parser.add_argument(
         "--with-keywords",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="write output to a copy with the '__note' suffix "
-        "(default: enabled; use --no-with-keywords to disable)",
+        help="write output to a copy with the '__note' suffix",
     )
     parser.add_argument(
         "--state",
@@ -914,20 +1053,12 @@ def parse_args():
         default="all",
         help="filter books by reading state",
     )
-    parser.add_argument(
-        "--epub-pdf",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="convert EPUB to PDF for proper annotation support "
-        "(default: use <mark> tags in EPUB)",
-    )
     parser.add_argument("--debug", action="store_true", help="dump book text")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
     if args.verify_citations_complete:
         verify_citations_complete(args.readera_backup_path)
         return
@@ -949,7 +1080,6 @@ def main():
             args.readera_data_path,
             args.with_keywords,
             args.state,
-            args.epub_pdf,
         )
         sys.exit(0 if ok else 1)
     elif args.add_highlights_bystate:
@@ -959,7 +1089,6 @@ def main():
             args.readera_data_path,
             args.with_keywords,
             args.state,
-            args.epub_pdf,
         )
     else:
         sys.exit("No action selected. Use --help.")
